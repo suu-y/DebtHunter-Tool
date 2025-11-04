@@ -28,6 +28,7 @@ import com.github.javaparser.ast.CompilationUnit;
 import com.github.javaparser.ast.PackageDeclaration;
 import com.github.javaparser.ast.body.ClassOrInterfaceDeclaration;
 import com.github.javaparser.ast.body.MethodDeclaration;
+import com.github.javaparser.ast.comments.Comment;
 import com.github.javaparser.ast.visitor.VoidVisitorAdapter;
 
 import tool.DataHandler;
@@ -44,6 +45,7 @@ public class JavaParsing {
 	private static Map<String, List<CommentInfo>> parseClass(InputStream filePath, String fileName) throws IOException {
 		CompilationUnit cu = null;
 		Map<String, List<CommentInfo>> elements = new HashMap<>();
+		Set<String> processedComments = new HashSet<>();
 	
 		try {
 			ParserConfiguration configuration = new ParserConfiguration();
@@ -66,77 +68,77 @@ public class JavaParsing {
 			.map(PackageDeclaration::getNameAsString)
 			.orElse("default");
 	
-		MethodVisitor methodVisitor = new MethodVisitor();
-		cu.accept(methodVisitor, null);
-	
 		List<ClassOrInterfaceDeclaration> classes = cu.findAll(ClassOrInterfaceDeclaration.class);
 		for (ClassOrInterfaceDeclaration ci : classes) {
 			String className = packageName + "." + ci.getName().asString();
-			List<CommentInfo> comments = ci.getAllContainedComments().stream().map(c -> {
-				int beginLineNumber = c.getBegin().map(p -> p.line).orElse(-1);
-				int endLineNumber = c.getEnd().map(p -> p.line).orElse(-1);
-				String methodName = methodVisitor.getMethodNameForLine(beginLineNumber);
-				return new CommentInfo(c.getContent().trim().replaceAll("//|\\*", "").replaceAll("\\s+", " "), beginLineNumber, endLineNumber, methodName, fileName);
-			}).collect(Collectors.toList());
-	
-			elements.put(className, comments);
+			List<CommentInfo> comments = new ArrayList<>();
+			
+			// Extract only comments within methods
+			List<MethodDeclaration> methods = ci.findAll(MethodDeclaration.class);
+			for (MethodDeclaration method : methods) {
+				String methodName = method.getNameAsString();
+				
+				// Get comments within the method body
+				if (method.getBody().isPresent()) {
+					List<Comment> methodComments = method.getBody().get().getAllContainedComments();
+					
+					for (Comment comment : methodComments) {
+						int beginLineNumber = comment.getBegin().map(p -> p.line).orElse(-1);
+						int endLineNumber = comment.getEnd().map(p -> p.line).orElse(-1);
+						String commentContent = comment.getContent().trim();
+						
+						if (commentContent.isEmpty() || commentContent.matches("^\\s*$")) {
+							continue;
+						}
+						
+						// Check uniqueness of comments (prevent duplicates)
+						String commentKey = className + ":" + beginLineNumber + ":" + endLineNumber + ":" + commentContent;
+						if (!processedComments.contains(commentKey)) {
+							processedComments.add(commentKey);
+							comments.add(new CommentInfo(commentContent, beginLineNumber, endLineNumber, methodName, fileName));
+						}
+					}
+				}
+			}
+			
+			// Also add class-level comments (outside methods)
+			List<Comment> classComments = ci.getAllContainedComments();
+			for (Comment comment : classComments) {
+				// Check if the comment is not contained within any method
+				boolean isInMethod = false;
+				for (MethodDeclaration method : methods) {
+					if (method.getBody().isPresent()) {
+						List<Comment> methodComments = method.getBody().get().getAllContainedComments();
+						if (methodComments.contains(comment)) {
+							isInMethod = true;
+							break;
+						}
+					}
+				}
+				
+				if (!isInMethod) {
+					int beginLineNumber = comment.getBegin().map(p -> p.line).orElse(-1);
+					int endLineNumber = comment.getEnd().map(p -> p.line).orElse(-1);
+					String commentContent = comment.getContent().trim();
+					
+					if (commentContent.isEmpty() || commentContent.matches("^\\s*$")) {
+						continue;
+					}
+					
+					String commentKey = className + ":" + beginLineNumber + ":" + endLineNumber + ":" + commentContent;
+					if (!processedComments.contains(commentKey)) {
+						processedComments.add(commentKey);
+						comments.add(new CommentInfo(commentContent, beginLineNumber, endLineNumber, "", fileName));
+					}
+				}
+			}
+			
+			
+			if (!comments.isEmpty()) {
+				elements.put(className, comments);
+			}
 		}
 		return elements;
-	}
-	
-
-	static class MethodVisitor extends VoidVisitorAdapter<Void> {
-		private List<MethodRange> methodRanges = new ArrayList<>();
-	
-		@Override
-		public void visit(MethodDeclaration md, Void arg) {
-			super.visit(md, arg);
-			int beginLine = md.getBegin().map(p -> p.line).orElse(-1);
-			int endLine = md.getEnd().map(p -> p.line).orElse(-1);
-			String methodName = md.getNameAsString();
-			methodRanges.add(new MethodRange(beginLine, endLine, methodName));
-		}
-	
-		/*
-		 * Identify the method to which the comment belongs
-		 */
-		public String getMethodNameForLine(int lineNumber) {
-			for (MethodRange range : methodRanges) {
-				if (lineNumber >= range.getBeginLine() && lineNumber <= range.getEndLine()) {
-					return range.getMethodName();
-				}
-			}
-			for (MethodRange range : methodRanges) {
-				if (lineNumber < range.getBeginLine()) {
-					return range.getMethodName();
-				}
-			}
-			return "";
-		}
-	
-		static class MethodRange {
-			private int beginLine;
-			private int endLine;
-			private String methodName;
-	
-			public MethodRange(int beginLine, int endLine, String methodName) {
-				this.beginLine = beginLine;
-				this.endLine = endLine;
-				this.methodName = methodName;
-			}
-	
-			public int getBeginLine() {
-				return beginLine;
-			}
-	
-			public int getEndLine() {
-				return endLine;
-			}
-	
-			public String getMethodName() {
-				return methodName;
-			}
-		}
 	}
 	
 
@@ -178,20 +180,28 @@ public class JavaParsing {
 	
 		Map<String, List<CommentInfo>> comments = new HashMap<>();
 		Set<String> packages = new HashSet<>();
+		int processedFiles = 0;
+		int filesWithComments = 0;
 		InputStream clas = it.nextStream();
 		while (clas != null) {
 			// String fileName = ((DirectoryIterator) it).getCurrentFileName();
 			String fileName = ((DirectoryIterator) it).getCurrentFilePath().replace(path, "");;
-	
+			processedFiles++;
+
 			Map<String, List<CommentInfo>> aux = parseClass(clas, fileName);
 			if (aux.size() > 0) {
+				filesWithComments++;
 				comments.putAll(aux);
 				String cc = findClass(aux.keySet());
 				if (cc != null && cc.contains(".")) packages.add(cc.substring(0, cc.lastIndexOf(".")));
+				// System.out.println("Found " + aux.size() + " classes with comments in: " + fileName);
 			}
-	
+
 			clas = it.nextStream();
 		}
+		
+		System.out.println("Processed " + processedFiles + " files, found comments in " + filesWithComments + " files");
+		System.out.println("Total comments found: " + comments.size());
 	
 		if (firstTime) {
 			BufferedWriter writer = Files.newBufferedWriter(Paths.get(outputPath + "/comments.csv"));
